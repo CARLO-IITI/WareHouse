@@ -25,6 +25,10 @@ from warehouse_management.queries import (
     get_zone_item_distribution, get_zone_summary, get_zones_list,
     get_item_full_detail, search_items, simulate_pick_path,
 )
+from warehouse_management.warehouse_graph import (
+    build_warehouse_graph, get_graph_stats, get_graph_for_visualization,
+    slot_to_picking_distance, slot_to_slot_distance,
+)
 
 st.set_page_config(page_title="Warehouse Slotting", page_icon="🏭", layout="wide", initial_sidebar_state="expanded")
 
@@ -1068,10 +1072,11 @@ def page_intelligence(session):
     st.markdown("### 🧠 Intelligence & Patent Features")
     st.caption("Self-healing slotting, temporal velocity, pick-path simulation, ergonomic scoring, constraint relaxation")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "❤️ Health Monitor",
         "📈 Temporal Velocity",
         "🛤️ Pick Path Sim",
+        "🕸️ Graph View",
         "💰 Re-Slotting ROI",
         "🚧 Congestion",
         "🔗 Cross-Category",
@@ -1242,8 +1247,86 @@ def page_intelligence(session):
                     f'Total distance: {result["total_distance"]:.0f}m vs {result["random_distance"]:.0f}m random.</div>',
                     unsafe_allow_html=True)
 
-    # ── TAB 4: Re-Slotting ROI ──────────────────────────────────
+    # ── TAB 4: Graph View ─────────────────────────────────────────
     with tab4:
+        st.markdown("#### 🕸️ Warehouse Graph Model")
+        st.markdown(
+            "The warehouse is modeled as a **NetworkX graph** where nodes are "
+            "picking area, zone entries, racks, and slots. Edges are walkable paths "
+            "with weights = actual walking distance. The algorithm uses **Dijkstra's shortest path** "
+            "instead of naive Euclidean distance."
+        )
+
+        try:
+            wg = build_warehouse_graph(session)
+            stats = get_graph_stats(wg)
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: mc("Nodes", f"{stats['total_nodes']:,}")
+            with c2: mc("Edges", f"{stats['total_edges']:,}")
+            with c3: mc("Connected", "Yes" if stats["is_connected"] else "No")
+            with c4: mc("Avg Degree", f"{stats['avg_degree']:.1f}")
+
+            st.markdown("**Node types:**")
+            for ntype, count in stats["node_types"].items():
+                st.markdown(f"- **{ntype}**: {count}")
+
+            # Visualize graph using Plotly
+            viz = get_graph_for_visualization(wg)
+            if viz["nodes"]:
+                node_x = [n["x"] for n in viz["nodes"]]
+                node_y = [n["y"] for n in viz["nodes"]]
+                node_colors = []
+                node_sizes = []
+                node_labels = []
+                type_colors = {"picking": "#22c55e", "zone": "#3b82f6", "rack": "#eab308", "slot": "#64748b"}
+                type_sizes = {"picking": 20, "zone": 14, "rack": 10, "slot": 5}
+                for n in viz["nodes"]:
+                    node_colors.append(type_colors.get(n["type"], "#64748b"))
+                    node_sizes.append(type_sizes.get(n["type"], 5))
+                    node_labels.append(f"{n['id']}<br>Type: {n['type']}")
+
+                edge_x, edge_y = [], []
+                for e in viz["edges"]:
+                    f_node = next((n for n in viz["nodes"] if n["id"] == e["from"]), None)
+                    t_node = next((n for n in viz["nodes"] if n["id"] == e["to"]), None)
+                    if f_node and t_node:
+                        edge_x += [f_node["x"], t_node["x"], None]
+                        edge_y += [f_node["y"], t_node["y"], None]
+
+                fig = go_module.Figure()
+                fig.add_trace(go_module.Scatter(
+                    x=edge_x, y=edge_y, mode="lines",
+                    line=dict(width=0.5, color="#334155"),
+                    hoverinfo="none", showlegend=False,
+                ))
+                fig.add_trace(go_module.Scatter(
+                    x=node_x, y=node_y, mode="markers",
+                    marker=dict(size=node_sizes, color=node_colors, line=dict(width=0)),
+                    text=node_labels, hoverinfo="text", showlegend=False,
+                ))
+                fig.update_layout(
+                    height=500, template="plotly_dark",
+                    paper_bgcolor="#080c18", plot_bgcolor="#111827",
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    xaxis=dict(visible=False), yaxis=dict(visible=False, scaleanchor="x"),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown(
+                    '<div style="background:#0c1020;border:1px solid #1a2236;border-radius:8px;padding:10px;'
+                    'font-size:.75rem;color:#94a3b8">'
+                    '💡 <b>Green</b> = Picking Area · <b>Blue</b> = Zone Entries · '
+                    '<b>Amber</b> = Racks · <b>Grey</b> = Slots. '
+                    'Edges represent walkable paths. The algorithm uses Dijkstra shortest-path '
+                    'distance through this graph instead of straight-line Euclidean distance.</div>',
+                    unsafe_allow_html=True)
+
+        except Exception as e:
+            st.error(f"Could not build graph: {e}")
+
+    # ── TAB 5: Re-Slotting ROI ──────────────────────────────────
+    with tab5:
         st.markdown("#### Move Task List — Is it worth relocating these items?")
         st.markdown(
             "The system identifies items placed suboptimally and calculates whether "
@@ -1310,8 +1393,8 @@ def page_intelligence(session):
                 unsafe_allow_html=True,
             )
 
-    # ── TAB 5: Congestion Analysis ──────────────────────────────
-    with tab5:
+    # ── TAB 6: Congestion Analysis ──────────────────────────────
+    with tab6:
         st.markdown("#### Aisle Congestion Risk")
         st.markdown(
             "When too many fast-moving items are crammed into the same zone, pickers get stuck "
@@ -1375,8 +1458,8 @@ def page_intelligence(session):
                 unsafe_allow_html=True,
             )
 
-    # ── TAB 6: Cross-Category Proof ─────────────────────────────
-    with tab6:
+    # ── TAB 7: Cross-Category Proof ─────────────────────────────
+    with tab7:
         st.markdown("#### Cross-Category Clustering Proof")
         st.markdown(
             "These are items from **different product categories** that the KNN algorithm placed "

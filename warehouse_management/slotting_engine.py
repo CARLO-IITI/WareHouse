@@ -33,6 +33,7 @@ except (BrokenPipeError, OSError):
         def close(self): pass
 
 from .constraints import check_tag_compatibility, filter_compatible_slots_vectorized, filter_with_relaxation
+from .warehouse_graph import WarehouseGraph, build_warehouse_graph, slot_to_picking_distance
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +275,8 @@ class WarehouseState:
     slot_idx_map: dict[int, int] = field(default_factory=dict)
     assignments: dict[int, int] = field(default_factory=dict)
     compatible_zones_cache: dict[str, np.ndarray] = field(default_factory=dict)
+    warehouse_graph: WarehouseGraph = None
+    slot_graph_distances: np.ndarray = None  # graph distance from each slot to picking area
 
 
 def load_warehouse_state(session: Session) -> WarehouseState:
@@ -317,6 +320,15 @@ def load_warehouse_state(session: Session) -> WarehouseState:
     state.slot_rack_shelves = rack_shelf_counts
     if n > 0:
         state.slot_kdtree = KDTree(slot_array[:, 1:3])
+
+    # Build the warehouse graph and compute graph-based distances
+    state.warehouse_graph = build_warehouse_graph(session)
+    graph_dists = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        sid = int(slot_array[i, 0])
+        graph_dists[i] = slot_to_picking_distance(state.warehouse_graph, sid)
+    state.slot_graph_distances = graph_dists
+    print(f"  Graph distances computed: min={graph_dists.min():.1f}m, max={graph_dists.max():.1f}m, avg={graph_dists.mean():.1f}m")
 
     elapsed = time.time() - t0
     print(f"  Loaded: {n} slots, {len(state.zone_tags)} zones ({elapsed:.1f}s)")
@@ -605,21 +617,29 @@ def assign_items_to_slots(
             "daily_picks": oc[0] * 2.0,  # normalized score * 2 as proxy for daily picks
         }
 
-    # Compute zone slot availability
+    # Compute zone slot availability and graph-based zone distances
     zone_slots_available: dict[int, int] = {}
+    graph_zone_distances: dict[int, float] = {}
     for zid in state.zone_tags:
         mask = (state.slot_zone_ids == zid) & (state.slot_data[:, 9] == 0)
         zone_slots_available[zid] = int(np.sum(mask))
+        # Use average graph distance for slots in this zone (more accurate than flat zone distance)
+        zone_mask = state.slot_zone_ids == zid
+        if state.slot_graph_distances is not None and np.sum(zone_mask) > 0:
+            graph_zone_distances[zid] = float(np.mean(state.slot_graph_distances[zone_mask]))
+        else:
+            graph_zone_distances[zid] = state.zone_distances.get(zid, 40.0)
 
     print(f"  Items to assign: {len(items)}")
     print(f"  DBSCAN clusters: {affinity_index.n_clusters} + {len(affinity_index.noise_items)} noise")
     print(f"  Zones: {list(state.zone_distances.keys())}")
     print(f"  Available slots per zone: {zone_slots_available}")
+    print(f"  Graph-based zone distances: {graph_zone_distances}")
 
-    # Run GA
+    # Run GA with graph-based distances (more accurate than flat zone distances)
     best_chrom, noise_zone_map = optimize_layout_ga(
         affinity_index, item_data,
-        state.zone_distances, zone_slots_available,
+        graph_zone_distances, zone_slots_available,
         state.zone_tags,
         pop_size=50, n_generations=100,
     )
@@ -708,12 +728,17 @@ def assign_items_to_slots(
             if len(in_target) > 0:
                 candidate_idx = in_target
 
-        # Score candidates: proximity + ergonomic (affinity is handled by GA cluster placement)
+        # Score candidates: proximity (graph-based) + ergonomic
         n_cand = len(candidate_idx)
         scores = np.zeros(n_cand, dtype=np.float64)
 
-        # Proximity: closer to picking = higher score, weighted by velocity
-        if max_zone_dist > 0:
+        # Proximity using GRAPH distances (Dijkstra, not Euclidean)
+        if state.slot_graph_distances is not None:
+            graph_dists = state.slot_graph_distances[candidate_idx]
+            max_gd = graph_dists.max() if len(graph_dists) > 0 else 1.0
+            if max_gd > 0:
+                scores += 0.6 * (1.0 - graph_dists / max_gd) * item_velocity
+        elif max_zone_dist > 0:
             dists = zone_dist_arr[candidate_idx]
             scores += 0.6 * (1.0 - dists / max_zone_dist) * item_velocity
 
