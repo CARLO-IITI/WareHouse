@@ -910,7 +910,7 @@ def page_manage_warehouse(session):
                 st.markdown("##### Configure rack layout")
                 c1, c2 = st.columns(2)
                 with c1:
-                    racks_per = st.number_input("Racks per zone", 2, 100, max(5, existing_items // 200), key="gen_rp4",
+                    racks_per = st.number_input("Racks per zone", 2, 500, min(100, max(5, existing_items // 200)), key="gen_rp4",
                                                 help="More racks = more shelf space for your items")
                 with c2:
                     ni = existing_items  # Use existing item count
