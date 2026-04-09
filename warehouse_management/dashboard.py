@@ -995,83 +995,226 @@ def page_manage_warehouse(session):
         with c3: mc("~Slots", f"{est_slots:,}")
         with c4: mc("Products", f"{ni:,}")
 
-        # ── Step 4: Preview what will be generated ──
-        st.markdown("##### Step 4: Preview")
-        _render_prebuild_preview(ni, no, zone_configs, est_slots)
-
         if st.button("🏗️ Build Warehouse & Place Products", type="primary", key="gen_go2", use_container_width=True):
             with st.spinner("Building warehouse..."):
                 result = generate_fresh_warehouse(session, zone_configs, ni, no)
             st.success(f"Built {result['zones']} zones with {result['slots']:,} slots. Added {result['items']:,} products and {result['orders']:,} purchase records.")
             _run_pipeline(session)
 
-    # ── TAB 2: Add products ─────────────────────────────────────
+    # ── TAB 2: Inventory Manager ─────────────────────────────────
     with tab2:
-        st.markdown("#### Add products to your warehouse")
-        st.markdown("Products are added to the inventory. Use **Re-Run Placement** (last tab) to assign them to shelves.")
+        st.markdown("#### 📦 Inventory Manager")
 
-        add_mode = st.radio("", ["Quick Add (pick categories)", "Single Custom Product"], horizontal=True, key="add_m2", label_visibility="collapsed")
+        inv_tab1, inv_tab2, inv_tab3, inv_tab4 = st.tabs([
+            "📋 View Inventory",
+            "➕ Add Products",
+            "🗑️ Remove Products",
+            "🔄 Replace All",
+        ])
 
-        if add_mode == "Quick Add (pick categories)":
-            st.markdown("##### Select categories and quantities")
-            st.caption("Choose one or more categories. Products with realistic names will be generated with proper tags automatically.")
+        # ── View current inventory ──
+        with inv_tab1:
+            total_items = session.execute(sa_text("SELECT COUNT(*) FROM items")).scalar() or 0
+            assigned = session.execute(sa_text("SELECT COUNT(*) FROM items WHERE current_slot_id IS NOT NULL")).scalar() or 0
 
-            selections = {}
-            cols = st.columns(2)
-            for i, (cat_label, cat_info) in enumerate(CATEGORY_INFO.items()):
-                with cols[i % 2]:
-                    with st.container():
+            c1, c2, c3 = st.columns(3)
+            with c1: mc("Total Products", f"{total_items:,}")
+            with c2: mc("On Shelves", f"{assigned:,}")
+            with c3: mc("Not Placed", f"{total_items - assigned:,}")
+
+            if total_items > 0:
+                # Category breakdown
+                cat_rows = session.execute(sa_text("""
+                    SELECT tags_json, COUNT(*) as cnt,
+                           SUM(CASE WHEN current_slot_id IS NOT NULL THEN 1 ELSE 0 END) as placed
+                    FROM items GROUP BY tags_json ORDER BY cnt DESC LIMIT 15
+                """)).fetchall()
+
+                st.markdown("##### Product breakdown by category")
+                inv_data = []
+                for cr in cat_rows:
+                    tags = json.loads(cr[0]) if cr[0] else ["unknown"]
+                    inv_data.append({
+                        "Category": ", ".join(tags),
+                        "Total": cr[1],
+                        "Placed": cr[2],
+                        "Unplaced": cr[1] - cr[2],
+                    })
+                st.dataframe(pd.DataFrame(inv_data), use_container_width=True, hide_index=True)
+
+                # Sample items
+                with st.expander("View sample items", expanded=False):
+                    sample = session.execute(sa_text("""
+                        SELECT name, sku, tags_json, weight_kg, width_cm, height_cm, depth_cm, velocity_class
+                        FROM items ORDER BY RANDOM() LIMIT 20
+                    """)).fetchall()
+                    sample_df = pd.DataFrame(sample, columns=["Name", "SKU", "Tags", "Weight(kg)", "W(cm)", "H(cm)", "D(cm)", "Speed"])
+                    sample_df["Speed"] = sample_df["Speed"].map(VELOCITY_LABELS)
+                    sample_df["Tags"] = sample_df["Tags"].apply(lambda x: ", ".join(json.loads(x)) if x else "")
+                    st.dataframe(sample_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No products in inventory. Use 'Add Products' or 'Replace All' to add items.")
+
+        # ── Add products ──
+        with inv_tab2:
+            add_mode = st.radio("", ["Quick Add by Category", "Add Single Product"], horizontal=True, key="add_m2", label_visibility="collapsed")
+
+            if add_mode == "Quick Add by Category":
+                st.caption("Select categories and quantities. Products with realistic names will be generated automatically.")
+                selections = {}
+                cols = st.columns(2)
+                for i, (cat_label, cat_info) in enumerate(CATEGORY_INFO.items()):
+                    with cols[i % 2]:
                         enabled = st.checkbox(cat_label, value=(i < 3), key=f"cat_en_{i}")
                         if enabled:
-                            qty = st.slider(f"How many {cat_label.split(' ',1)[1]} products?", 5, 500, 50, key=f"cat_q_{i}")
+                            qty = st.slider(f"How many?", 5, 500, 50, key=f"cat_q_{i}")
                             st.caption(cat_info["desc"])
                             selections[cat_label] = (cat_info, qty)
 
-            total_to_add = sum(q for _, q in selections.values())
-            if total_to_add > 0:
-                st.markdown(f"**Total: {total_to_add} products** across {len(selections)} categories")
+                total_to_add = sum(q for _, q in selections.values())
+                if total_to_add > 0:
+                    st.markdown(f"**Total: {total_to_add} products** across {len(selections)} categories")
 
-            if st.button(f"📦 Add {total_to_add} Products", type="primary", key="add_multi",
-                         disabled=total_to_add == 0, use_container_width=True):
-                from warehouse_management.test_data import _generate_product_name
-                all_data = []
-                for cat_label, (cat_info, qty) in selections.items():
-                    for _ in range(qty):
-                        all_data.append({
-                            "name": _generate_product_name(cat_info["key"]),
-                            "tags": cat_info["tags"],
-                            "weight_kg": round(random.uniform(0.1, 5.0), 2),
-                            "width_cm": round(random.uniform(5, 30), 1),
-                            "height_cm": round(random.uniform(5, 30), 1),
-                            "depth_cm": round(random.uniform(5, 30), 1),
-                        })
-                added = add_items_to_db(session, all_data)
-                st.success(f"Added {added} products! Go to **Re-Run Placement** tab to assign them to shelves.")
+                if st.button(f"➕ Add {total_to_add} Products", type="primary", key="add_multi",
+                             disabled=total_to_add == 0, use_container_width=True):
+                    from warehouse_management.test_data import _generate_product_name
+                    all_data = []
+                    for cat_label, (cat_info, qty) in selections.items():
+                        for _ in range(qty):
+                            all_data.append({
+                                "name": _generate_product_name(cat_info["key"]),
+                                "tags": cat_info["tags"],
+                                "weight_kg": round(random.uniform(0.1, 5.0), 2),
+                                "width_cm": round(random.uniform(5, 30), 1),
+                                "height_cm": round(random.uniform(5, 30), 1),
+                                "depth_cm": round(random.uniform(5, 30), 1),
+                            })
+                    added = add_items_to_db(session, all_data)
+                    st.success(f"Added {added} products! Use **Re-Run Placement** to assign them.")
+            else:
+                with st.form("custom_product"):
+                    name = st.text_input("Product name", "Organic Almonds 500g")
+                    cat_sel = st.selectbox("Category", list(CATEGORY_INFO.keys()), key="cp_cat")
+                    cat_info = CATEGORY_INFO[cat_sel]
+                    auto_tags = st.checkbox("Auto-assign tags", value=True, key="cp_auto")
+                    final_tags = cat_info["tags"] if auto_tags else [t.strip() for t in st.text_input("Tags", ",".join(cat_info["tags"]), key="cp_tags").split(",")]
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1: wt = st.number_input("Weight (kg)", 0.05, 50.0, 1.0, step=0.1)
+                    with c2: wi = st.number_input("Width (cm)", 1.0, 100.0, 15.0)
+                    with c3: hi = st.number_input("Height (cm)", 1.0, 100.0, 15.0)
+                    with c4: di = st.number_input("Depth (cm)", 1.0, 100.0, 15.0)
+                    if st.form_submit_button("➕ Add Product", type="primary", use_container_width=True):
+                        add_items_to_db(session, [{"name": name, "tags": final_tags,
+                                                   "weight_kg": wt, "width_cm": wi, "height_cm": hi, "depth_cm": di}])
+                        st.success(f"Added **{name}**!")
 
-        else:
-            st.markdown("##### Add a single product with full control")
-            with st.form("custom_product"):
-                name = st.text_input("Product name", "Organic Almonds 500g")
-                cat_sel = st.selectbox("Category", list(CATEGORY_INFO.keys()), key="cp_cat")
-                cat_info = CATEGORY_INFO[cat_sel]
-                auto_tags = st.checkbox("Use automatic tags for this category", value=True, key="cp_auto")
-                if auto_tags:
-                    st.info(f"Tags: {', '.join(cat_info['tags'])}")
-                    final_tags = cat_info["tags"]
-                else:
-                    custom_tags = st.text_input("Custom tags (comma separated)", ",".join(cat_info["tags"]), key="cp_tags")
-                    final_tags = [t.strip() for t in custom_tags.split(",")]
+        # ── Remove products ──
+        with inv_tab3:
+            st.markdown("Remove products from inventory by category or clear everything.")
 
-                c1, c2, c3, c4 = st.columns(4)
-                with c1: wt = st.number_input("Weight (kg)", 0.05, 50.0, 1.0, step=0.1)
-                with c2: wi = st.number_input("Width (cm)", 1.0, 100.0, 15.0)
-                with c3: hi = st.number_input("Height (cm)", 1.0, 100.0, 15.0)
-                with c4: di = st.number_input("Depth (cm)", 1.0, 100.0, 15.0)
+            remove_mode = st.radio("", ["Remove by category", "Remove by search", "Clear ALL products"], horizontal=True, key="rm_mode", label_visibility="collapsed")
 
-                if st.form_submit_button("Add Product", type="primary", use_container_width=True):
-                    add_items_to_db(session, [{"name": name, "tags": final_tags,
-                                               "weight_kg": wt, "width_cm": wi, "height_cm": hi, "depth_cm": di}])
-                    st.success(f"Added **{name}**! Go to **Re-Run Placement** to assign it to a shelf.")
+            if remove_mode == "Remove by category":
+                cat_rows = session.execute(sa_text("""
+                    SELECT tags_json, COUNT(*) as cnt FROM items GROUP BY tags_json ORDER BY cnt DESC
+                """)).fetchall()
+                if cat_rows:
+                    cat_options = {f"{', '.join(json.loads(r[0]))} ({r[1]:,} items)": r[0] for r in cat_rows}
+                    sel_cat = st.selectbox("Select category to remove", list(cat_options.keys()), key="rm_cat")
+                    if st.button("🗑️ Remove all items in this category", type="primary", key="rm_cat_btn"):
+                        tags_json = cat_options[sel_cat]
+                        session.execute(sa_text("UPDATE slots SET current_weight_kg = 0 WHERE id IN (SELECT current_slot_id FROM items WHERE tags_json = :tj AND current_slot_id IS NOT NULL)"), {"tj": tags_json})
+                        session.execute(sa_text("DELETE FROM items WHERE tags_json = :tj"), {"tj": tags_json})
+                        session.commit()
+                        st.success(f"Removed all items in category. Re-run placement to reorganize.")
+
+            elif remove_mode == "Remove by search":
+                rm_search = st.text_input("Search product to remove", key="rm_search")
+                if rm_search and len(rm_search) >= 2:
+                    matches = session.execute(sa_text(
+                        "SELECT id, name, sku, tags_json FROM items WHERE LOWER(name) LIKE LOWER(:q) LIMIT 20"
+                    ), {"q": f"%{rm_search}%"}).fetchall()
+                    if matches:
+                        rm_options = {f"{r[1]} ({r[2]})": r[0] for r in matches}
+                        sel_rm = st.selectbox("Select product to remove", list(rm_options.keys()), key="rm_sel")
+                        if st.button("🗑️ Remove this product", key="rm_single_btn"):
+                            iid = rm_options[sel_rm]
+                            session.execute(sa_text("UPDATE slots SET current_weight_kg = 0 WHERE id = (SELECT current_slot_id FROM items WHERE id = :iid)"), {"iid": iid})
+                            session.execute(sa_text("DELETE FROM items WHERE id = :iid"), {"iid": iid})
+                            session.commit()
+                            st.success(f"Removed {sel_rm}")
+                    else:
+                        st.info("No matching products found.")
+
+            else:
+                st.warning("This will delete ALL products from inventory. Shelf assignments will also be cleared.")
+                if st.button("🗑️ Delete ALL Products", type="primary", key="rm_all_btn"):
+                    session.execute(sa_text("UPDATE slots SET current_weight_kg = 0"))
+                    session.execute(sa_text("DELETE FROM items"))
+                    session.commit()
+                    st.success("All products removed. Add new products or generate a new warehouse.")
+
+        # ── Replace all inventory ──
+        with inv_tab4:
+            st.markdown("#### Replace entire inventory")
+            st.markdown("Delete all current products and generate fresh ones. Useful for testing different product mixes.")
+
+            current_count = session.execute(sa_text("SELECT COUNT(*) FROM items")).scalar() or 0
+            if current_count > 0:
+                st.info(f"Currently **{current_count:,}** products in inventory. This will replace them all.")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                new_count = st.number_input("New product count", 100, 200000, max(1000, current_count), step=500, key="repl_n")
+            with c2:
+                new_orders = st.number_input("New order history", 1000, 500000, 10000, step=1000, key="repl_o",
+                                             help="Simulated customer orders for affinity analysis")
+
+            if st.button("🔄 Replace All Products & Orders", type="primary", key="repl_btn", use_container_width=True):
+                with st.spinner("Clearing old products..."):
+                    session.execute(sa_text("UPDATE slots SET current_weight_kg = 0"))
+                    session.execute(sa_text("DELETE FROM order_history"))
+                    session.execute(sa_text("DELETE FROM items"))
+                    session.commit()
+
+                with st.spinner(f"Generating {new_count:,} new products..."):
+                    from warehouse_management.test_data import AFFINITY_GROUPS, _generate_item_dimensions, _generate_product_name
+                    from warehouse_management.models import Item, OrderHistory
+                    from warehouse_management.test_data import generate_order_history
+                    import random as _r
+
+                    items = []
+                    sku_counter = 0
+                    filler_cats = [
+                        ("grocery", ["grocery"]), ("household", ["chemical","household"]),
+                        ("electronics", ["electronics","fragile"]), ("clothing", ["clothing"]),
+                        ("general", ["general"]), ("heavy", ["heavy","industrial"]),
+                        ("beverage", ["grocery","beverage"]),
+                    ]
+                    for gn, gr in AFFINITY_GROUPS.items():
+                        for iname in gr["items"]:
+                            sku_counter += 1
+                            dims = _generate_item_dimensions(gr["tags"])
+                            items.append(Item(sku=f"SKU-{sku_counter:06d}", name=iname,
+                                              tags_json=json.dumps(gr["tags"]), **dims))
+                    remaining = new_count - len(items)
+                    for _ in range(max(0, remaining)):
+                        sku_counter += 1
+                        cat_name, tags = _r.choice(filler_cats)
+                        dims = _generate_item_dimensions(tags)
+                        items.append(Item(sku=f"SKU-{sku_counter:06d}",
+                                          name=_generate_product_name(cat_name),
+                                          tags_json=json.dumps(tags), **dims))
+                    _r.shuffle(items)
+                    for start in range(0, len(items), 5000):
+                        session.add_all(items[start:start+5000])
+                        session.flush()
+
+                with st.spinner(f"Generating {new_orders:,} order records..."):
+                    generate_order_history(session, items, n_orders=new_orders//5, target_records=new_orders)
+                    session.commit()
+
+                st.success(f"Replaced inventory: {len(items):,} products, {new_orders:,} order records. Use **Re-Run Placement** to assign them.")
 
     # ── TAB 3: Add racks ────────────────────────────────────────
     with tab3:
