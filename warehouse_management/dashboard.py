@@ -428,8 +428,14 @@ def page_warehouse(session):
 
                     if sl["occ"]:
                         grp = sl.get("grp", "")
-                        grp_tip = f" | 🔗 {grp}" if grp else ""
-                        tip = f'{sl["name"]} ({sl["sku"]}) | {vl(sl["vc"])} | {sl["w"]:.1f}kg{grp_tip}'
+                        grp_line = f"\n🔗 Group: {grp}" if grp else ""
+                        tip = (f'{sl["name"]}\n'
+                               f'SKU: {sl["sku"]}\n'
+                               f'Speed: {vl(sl["vc"])}\n'
+                               f'Weight: {sl["w"]:.1f}kg\n'
+                               f'Zone: {zone["name"]} ({zone["distance"]}m)\n'
+                               f'Rack: {rack["name"]} | Shelf {sh_num}'
+                               f'{grp_line}')
 
                         # Priority 1: Single product selected from picker
                         if highlight_slot_id and sl["id"] == highlight_slot_id:
@@ -450,7 +456,7 @@ def page_warehouse(session):
                         else:
                             cls = {"A": "bms-fast", "B": "bms-reg", "C": "bms-slow"}.get(sl["vc"], "bms-slow")
                     else:
-                        tip = "Empty slot"
+                        tip = f'Empty slot\nZone: {zone["name"]}\nRack: {rack["name"]} | Shelf {sh_num}'
                         if has_highlight:
                             cls = "bms-empty bms-dim"
 
@@ -489,30 +495,43 @@ def page_warehouse(session):
 
         if empty_slots == 0:
             reason = "All shelf slots are full — no physical space left."
-            fix = "Add more racks in **⚙️ Manage Warehouse → Add Racks** to create more shelf space."
+            fix = "Add more racks in **⚙️ Manage Warehouse → Add Racks**."
         else:
-            reason = "Some items don't match any available zone's tags, or they don't fit the remaining slot dimensions."
-            fix = "Check zone tag compatibility or add zones with matching tags."
+            reason = "Items are too heavy or too large for available slots (even after constraint relaxation)."
+            fix = "Add racks with higher weight capacity, or the items will be force-placed on next re-run."
 
-        with st.expander(f"⚠️ {unplaced:,} products not placed ({pct_unplaced}%) — why?", expanded=False):
-            st.markdown(f"**{kpi['total_items']:,}** products in inventory, but only **{kpi['total_slots']:,}** shelf slots available.")
-            st.markdown(f"**Slots filled:** {kpi['used_slots']:,} / {kpi['total_slots']:,} ({kpi['slot_utilization']}%)")
-            st.markdown(f"**Empty slots:** {empty_slots}")
-            st.markdown(f"**Primary reason:** {reason}")
-            st.markdown(f"**How to fix:** {fix}")
+        with st.expander(f"⚠️ {unplaced:,} products not placed ({pct_unplaced}%) — click for details", expanded=False):
+            st.markdown(f"**Inventory:** {kpi['total_items']:,} products · **Shelf space:** {kpi['total_slots']:,} slots")
+            st.markdown(f"**Filled:** {kpi['used_slots']:,} / {kpi['total_slots']:,} ({kpi['slot_utilization']}%) · **Empty:** {empty_slots}")
+            st.markdown(f"**Why:** {reason}")
+            st.markdown(f"**Fix:** {fix}")
 
-            # Breakdown by category
-            unplaced_by_tag = session.execute(sa_text("""
-                SELECT tags_json, COUNT(*) as cnt FROM items
-                WHERE current_slot_id IS NULL
-                GROUP BY tags_json ORDER BY cnt DESC LIMIT 8
+            # Show actual unplaced items with their specific issue
+            unplaced_items = session.execute(sa_text("""
+                SELECT i.name, i.tags_json, i.weight_kg, i.width_cm, i.height_cm, i.depth_cm
+                FROM items i WHERE i.current_slot_id IS NULL
+                ORDER BY i.weight_kg DESC LIMIT 15
             """)).fetchall()
-            if unplaced_by_tag:
-                st.markdown("**Unplaced by category:**")
-                tag_data = [{"Category": json.loads(r[0]) if r[0] else ["unknown"], "Count": r[1]} for r in unplaced_by_tag]
-                for td in tag_data:
-                    tags_str = ", ".join(td["Category"])
-                    st.markdown(f"- **{tags_str}**: {td['Count']:,} items")
+            if unplaced_items:
+                slot_max_w = session.execute(sa_text("SELECT MAX(max_weight_kg) FROM slots")).scalar() or 8
+                slot_dims = session.execute(sa_text(
+                    "SELECT width_cm, height_cm, depth_cm FROM slots LIMIT 1"
+                )).fetchone()
+                slot_dim_str = f"{slot_dims[0]:.0f}×{slot_dims[1]:.0f}×{slot_dims[2]:.0f}cm" if slot_dims else "?"
+
+                st.markdown(f"**Unplaced items** (slot max weight: {slot_max_w:.1f}kg, slot dims: {slot_dim_str}):")
+                for ui in unplaced_items:
+                    w = ui[2]
+                    dims = sorted([ui[3], ui[4], ui[5]])
+                    issues = []
+                    if w > slot_max_w * 3:
+                        issues.append(f"⚖️ too heavy ({w:.1f}kg vs {slot_max_w:.1f}kg max)")
+                    if slot_dims and dims[0] > max(slot_dims):
+                        issues.append(f"📐 too large ({dims[0]:.0f}×{dims[1]:.0f}×{dims[2]:.0f}cm)")
+                    if not issues:
+                        issues.append("❓ unknown constraint")
+                    tags = json.loads(ui[1]) if ui[1] else []
+                    st.markdown(f"- **{ui[0]}** ({', '.join(tags)}) — {' · '.join(issues)}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -998,6 +1017,43 @@ def page_kpi(session):
         if not td.empty:
             td.columns=["SKU","Item","Class","Orders","Zone","Rack","Shelf"]
             st.dataframe(td, use_container_width=True, hide_index=True, height=340)
+
+    st.markdown("---")
+
+    # Additional analytics row
+    l3, r3 = st.columns(2)
+    with l3:
+        st.subheader("Placement Status")
+        placed = m["assigned_items"]
+        unplaced = m["unassigned_items"]
+        fig = px.pie(
+            names=["Placed on Shelves", "Not Placed (no space)"],
+            values=[placed, unplaced],
+            color_discrete_sequence=["#22c55e", "#ef4444"],
+            hole=0.45,
+        )
+        fig.update_layout(height=300, template="plotly_dark", paper_bgcolor="#080c18",
+                          margin=dict(l=10, r=10, t=5, b=10), legend=dict(font=dict(size=10)))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with r3:
+        st.subheader("Product Categories")
+        cat_rows = session.execute(sa_text("""
+            SELECT tags_json, COUNT(*) as cnt FROM items
+            GROUP BY tags_json ORDER BY cnt DESC LIMIT 10
+        """)).fetchall()
+        if cat_rows:
+            cat_names = []
+            cat_counts = []
+            for cr in cat_rows:
+                tags = json.loads(cr[0]) if cr[0] else ["unknown"]
+                cat_names.append(", ".join(tags))
+                cat_counts.append(cr[1])
+            fig = px.pie(names=cat_names, values=cat_counts,
+                         color_discrete_sequence=ZONE_COLORS, hole=0.4)
+            fig.update_layout(height=300, template="plotly_dark", paper_bgcolor="#080c18",
+                              margin=dict(l=10, r=10, t=5, b=10), legend=dict(font=dict(size=8)))
+            st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.subheader("Zone Summary")

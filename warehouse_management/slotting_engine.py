@@ -684,7 +684,7 @@ def assign_items_to_slots(
     assigned = 0
     failed = 0
     stats = {"A": 0, "B": 0, "C": 0, "failed_tags": 0, "failed_capacity": 0,
-             "relaxation_counts": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}, "exceptions": []}
+             "relaxation_counts": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}, "exceptions": []}
     update_batch = []
 
     # Sort items: A first (they get priority for near-picking slots)
@@ -722,7 +722,7 @@ def assign_items_to_slots(
         stats["relaxation_counts"][relax_level] = stats["relaxation_counts"].get(relax_level, 0) + 1
         if relax_level > 0:
             stats["exceptions"].append({"item": item_id, "level": relax_level,
-                                         "type": {1: "dimension", 2: "zone", 3: "weight", 4: "heavy"}.get(relax_level, "?")})
+                                         "type": {1: "dimension", 2: "zone", 3: "weight", 4: "oversize", 5: "forced"}.get(relax_level, "?")})
 
         # Prefer slots in the GA-assigned target zone
         target_zone = item_target_zone.get(item_id)

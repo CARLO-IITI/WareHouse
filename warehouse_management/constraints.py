@@ -228,16 +228,21 @@ def filter_with_relaxation(
     if len(candidates) > 0:
         return candidates, 3
 
-    # Level 4: relax weight by 100% AND dimensions by 30% (for heavy/oversize items)
+    # Level 4: relax weight by 100% AND ignore dimensions entirely
+    # If the only issue is physical size, the item can overflow the slot
+    # (e.g., placed across two positions or stacked differently)
     mask = slot_data[:, 9] == 0
-    remaining_heavy = slot_data[:, 7] * 2.0 - slot_data[:, 6]
+    remaining_heavy = slot_data[:, 7] * 3.0 - slot_data[:, 6]  # 3x weight capacity
     mask &= remaining_heavy >= item_weight
-    relaxed_dims = np.sort([item_width * 0.7, item_height * 0.7, item_depth * 0.7])
-    slot_dims3 = np.sort(slot_data[:, 3:6], axis=1)
-    mask &= np.all(slot_dims3 >= relaxed_dims, axis=1)
-    # Any zone with space
+    # No dimension check — item will be placed even if oversize
     candidates = np.where(mask)[0]
     if len(candidates) > 0:
         return candidates, 4
+
+    # Level 5: absolute last resort — any unoccupied slot, ignore all constraints
+    mask = slot_data[:, 9] == 0
+    candidates = np.where(mask)[0]
+    if len(candidates) > 0:
+        return candidates, 5
 
     return np.array([], dtype=np.int64), -1
