@@ -337,6 +337,91 @@ def add_racks_to_db(session: Session, zone_id: int, count: int,
     return count
 
 
+def auto_generate_zone_configs(n_items: int, total_racks: int) -> list[dict]:
+    """Auto-generate zone configs based on the product mix.
+
+    Analyzes what types of products will be generated and creates zones
+    proportionally so every product has a compatible zone with enough space.
+    """
+    from .test_data import AFFINITY_GROUPS
+
+    # Count expected items per tag category
+    # Affinity group items (fixed ~135 items)
+    tag_counts: dict[str, int] = {}
+    for gn, gr in AFFINITY_GROUPS.items():
+        key = ",".join(sorted(gr["tags"]))
+        tag_counts[key] = tag_counts.get(key, 0) + len(gr["items"])
+
+    # Filler categories (distributed equally among 7 categories)
+    filler_categories = [
+        ("grocery", ["grocery"]),
+        ("chemical,household", ["chemical", "household"]),
+        ("electronics,fragile", ["electronics", "fragile"]),
+        ("clothing", ["clothing"]),
+        ("general", ["general"]),
+        ("heavy,industrial", ["heavy", "industrial"]),
+        ("grocery,beverage", ["grocery", "beverage"]),
+    ]
+    remaining = n_items - sum(tag_counts.values())
+    per_cat = max(1, remaining // len(filler_categories))
+    for cat_key, tags in filler_categories:
+        key = ",".join(sorted(tags))
+        tag_counts[key] = tag_counts.get(key, 0) + per_cat
+
+    # Convert tag counts to zone configs
+    # Safety tags get dedicated zones, others can share
+    total_items = sum(tag_counts.values())
+    zone_configs = []
+    dist = 5.0  # start 5m from picking, increase for each zone
+
+    # Zone naming map
+    tag_zone_names = {
+        "grocery": "Grocery",
+        "beverage,grocery": "Beverages",
+        "grocery,perishable,refrigerated": "Dairy & Frozen",
+        "grocery,perishable": "Fresh & Perishable",
+        "chemical,household": "Household & Cleaning",
+        "flammable,hazardous": "Flammable Storage",
+        "electronics,fragile": "Electronics",
+        "clothing": "Clothing & Apparel",
+        "heavy,industrial": "Tools & Hardware",
+        "general": "General Merchandise",
+    }
+
+    for tag_key, count in sorted(tag_counts.items(), key=lambda x: -x[1]):
+        tags = tag_key.split(",")
+        name = tag_zone_names.get(tag_key, f"Zone-{tag_key.replace(',','-').title()}")
+
+        # Allocate racks proportional to item count
+        pct = count / total_items
+        racks = max(2, round(total_racks * pct))
+
+        # Safety-tagged zones go farthest from picking
+        is_safety = any(t in ("flammable", "hazardous", "chemical") for t in tags)
+        if is_safety:
+            zone_dist = 30.0 + dist * 0.5
+        else:
+            zone_dist = dist
+            dist += max(3.0, 15.0 * pct)  # closer zones for bigger categories
+
+        zone_configs.append({
+            "name": name, "tags": tags, "distance": round(zone_dist, 1),
+            "racks": racks, "shelves_per_rack": 6, "shelf_width": 100.0,
+        })
+
+    # Also add a "General Overflow" zone that accepts ANYTHING
+    zone_configs.append({
+        "name": "General Overflow",
+        "tags": ["general"],
+        "distance": round(dist + 5, 1),
+        "racks": max(2, total_racks // 10),
+        "shelves_per_rack": 6,
+        "shelf_width": 100.0,
+    })
+
+    return zone_configs
+
+
 def generate_fresh_warehouse(session: Session, zone_configs: list[dict],
                              n_items: int, n_orders: int) -> dict:
     """Generate a complete warehouse from user-provided zone configs.

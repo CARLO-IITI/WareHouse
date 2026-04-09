@@ -14,9 +14,9 @@ from sqlalchemy import text as sa_text
 from warehouse_management.database import DEFAULT_DB_PATH, create_db_engine, get_session_factory, init_db
 from warehouse_management.queries import (
     AFFINITY_GROUP_COLORS,
-    add_items_to_db, add_racks_to_db, compute_health_score,
-    compute_temporal_velocity, generate_fresh_warehouse,
-    generate_healing_plan,
+    add_items_to_db, add_racks_to_db, auto_generate_zone_configs,
+    compute_health_score, compute_temporal_velocity,
+    generate_fresh_warehouse, generate_healing_plan,
     get_affinity_group_placement, get_congestion_analysis,
     get_cross_category_pairs, get_distance_by_class, get_kpi_metrics,
     get_rack_detail, get_rack_info, get_racks_for_zone,
@@ -781,51 +781,72 @@ def page_manage_warehouse(session):
             no = st.number_input("Order history", 1000, 1000000, default_no, step=5000, key="gen_no3",
                                  help="Simulated customer orders — more = smarter placement")
 
-        preset_zones = [
-            ("Grocery", ["grocery"], 5.0),
-            ("Dairy & Frozen", ["grocery","perishable","refrigerated"], 10.0),
-            ("Beverages", ["grocery","beverage"], 12.0),
-            ("Household & Cleaning", ["chemical","household"], 22.0),
-            ("Flammable Storage", ["flammable","hazardous"], 38.0),
-            ("Electronics", ["electronics","fragile"], 18.0),
-            ("Clothing", ["clothing"], 16.0),
-            ("Tools & Hardware", ["heavy","industrial"], 32.0),
-            ("General Merchandise", ["general"], 8.0),
-            ("Pharmacy", ["chemical"], 6.0),
-            ("Frozen Foods", ["grocery","perishable","refrigerated"], 14.0),
-            ("Stationery", ["general"], 24.0),
-            ("Sports & Outdoor", ["general"], 28.0),
-            ("Pet Supplies", ["general"], 20.0),
-            ("Garden", ["general","heavy"], 35.0),
-        ]
+        # Step 3: Zone tag assignment
+        st.markdown("##### Step 3: Zone tags")
+        tag_mode = st.radio("How should zones be set up?", [
+            "🤖 Auto-assign (recommended)",
+            "✏️ Manual — I'll define zones myself",
+        ], key="gen_tag_mode", horizontal=True,
+            help="Auto-assign creates zones based on your product mix so every item has a place")
 
-        zone_configs = []
-        with st.expander(f"📋 Zone Details ({nz} zones) — click to customize", expanded=False):
-            st.caption("Each zone has a name, allowed product types (tags), and distance from the picking area. You can edit any of these.")
-            cols = st.columns(3)
-            for i in range(nz):
-                p = preset_zones[i] if i < len(preset_zones) else (f"Zone-{i+1}", ["general"], 10.0+i*5)
-                with cols[i % 3]:
-                    st.markdown(f"**Zone {i+1}**")
-                    name = st.text_input("Name", p[0], key=f"zn2_{i}")
-                    tags = st.text_input("Allowed types", ",".join(p[1]), key=f"zt2_{i}",
-                                         help="Product types allowed here: grocery, chemical, flammable, electronics, clothing, heavy, general")
-                    dist = st.number_input("Distance from picking (m)", 1.0, 100.0, p[2], key=f"zd2_{i}",
-                                           help="How far associates walk from picking area. Fast movers go in closer zones.")
-                    st.markdown("---")
+        if tag_mode.startswith("🤖"):
+            # Auto-generate zone configs from product mix
+            total_racks_est = nz * racks_per
+            zone_configs = auto_generate_zone_configs(ni, total_racks_est)
+
+            st.success(f"Auto-generated **{len(zone_configs)} zones** based on {ni:,} products. "
+                       f"Each product category gets proportional rack space + a General Overflow zone catches anything that doesn't fit.")
+
+            # Show preview
+            with st.expander("📋 Preview auto-generated zones", expanded=False):
+                for zc in zone_configs:
+                    tag_pills = " ".join(f"`{t}`" for t in zc["tags"])
+                    st.markdown(f"- **{zc['name']}** — {tag_pills} — {zc['racks']} racks — {zc['distance']}m from picking")
+        else:
+            # Manual mode
+            preset_zones = [
+                ("Grocery", ["grocery"], 5.0),
+                ("Dairy & Frozen", ["grocery","perishable","refrigerated"], 10.0),
+                ("Beverages", ["grocery","beverage"], 12.0),
+                ("Household & Cleaning", ["chemical","household"], 22.0),
+                ("Flammable Storage", ["flammable","hazardous"], 38.0),
+                ("Electronics", ["electronics","fragile"], 18.0),
+                ("Clothing", ["clothing"], 16.0),
+                ("Tools & Hardware", ["heavy","industrial"], 32.0),
+                ("General Merchandise", ["general"], 8.0),
+                ("Pharmacy", ["chemical"], 6.0),
+                ("Frozen Foods", ["grocery","perishable","refrigerated"], 14.0),
+                ("Stationery", ["general"], 24.0),
+                ("Sports & Outdoor", ["general"], 28.0),
+                ("Pet Supplies", ["general"], 20.0),
+                ("Garden", ["general","heavy"], 35.0),
+            ]
+
+            zone_configs = []
+            with st.expander(f"📋 Zone Details ({nz} zones) — click to customize", expanded=False):
+                st.caption("Each zone has a name, allowed product types (tags), and distance from the picking area.")
+                cols = st.columns(3)
+                for i in range(nz):
+                    p = preset_zones[i] if i < len(preset_zones) else (f"Zone-{i+1}", ["general"], 10.0+i*5)
+                    with cols[i % 3]:
+                        st.markdown(f"**Zone {i+1}**")
+                        name = st.text_input("Name", p[0], key=f"zn2_{i}")
+                        tags = st.text_input("Allowed types", ",".join(p[1]), key=f"zt2_{i}")
+                        dist = st.number_input("Distance from picking (m)", 1.0, 100.0, p[2], key=f"zd2_{i}")
+                        st.markdown("---")
+                        zone_configs.append({
+                            "name": name, "tags": [t.strip() for t in tags.split(",")],
+                            "distance": dist, "racks": racks_per,
+                            "shelves_per_rack": 6, "shelf_width": 100.0,
+                        })
+
+            if not zone_configs:
+                for i in range(nz):
+                    p = preset_zones[i] if i < len(preset_zones) else (f"Zone-{i+1}", ["general"], 10.0+i*5)
                     zone_configs.append({
-                        "name": name, "tags": [t.strip() for t in tags.split(",")],
-                        "distance": dist, "racks": racks_per,
-                        "shelves_per_rack": 6, "shelf_width": 100.0,
+                        "name": p[0], "tags": p[1], "distance": p[2],
+                        "racks": racks_per, "shelves_per_rack": 6, "shelf_width": 100.0,
                     })
-
-        if not zone_configs:
-            for i in range(nz):
-                p = preset_zones[i] if i < len(preset_zones) else (f"Zone-{i+1}", ["general"], 10.0+i*5)
-                zone_configs.append({
-                    "name": p[0], "tags": p[1], "distance": p[2],
-                    "racks": racks_per, "shelves_per_rack": 6, "shelf_width": 100.0,
-                })
 
         total_racks = sum(z["racks"] for z in zone_configs)
         est_slots = sum(z["racks"] * z["shelves_per_rack"] * 4 for z in zone_configs)
