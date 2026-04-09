@@ -881,20 +881,107 @@ CATEGORY_INFO = {
 def page_manage_warehouse(session):
     st.markdown("### ⚙️ Manage Warehouse")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🏗️ Create New Warehouse",
-        "📦 Add Products",
-        "🏗️ Add Racks",
-        "🔄 Re-Run Placement",
+    tab_inv, tab_wh, tab_racks, tab_run = st.tabs([
+        "📦 1. Inventory",
+        "🏗️ 2. Build Warehouse",
+        "🏗️ 3. Add Racks",
+        "🔄 4. Run Placement",
     ])
 
-    # ── TAB 1: Generate full warehouse ──────────────────────────
-    with tab1:
-        st.markdown("#### Build a new warehouse from scratch")
-        st.markdown("This will **replace** your current warehouse with a fresh one.")
+    # ── TAB 2: Build Warehouse ──────────────────────────────────
+    with tab_wh:
+        # Check for existing inventory
+        existing_items = session.execute(sa_text("SELECT COUNT(*) FROM items")).scalar() or 0
+        existing_orders = session.execute(sa_text("SELECT COUNT(*) FROM order_history")).scalar() or 0
+        existing_slots = session.execute(sa_text("SELECT COUNT(*) FROM slots")).scalar() or 0
+
+        if existing_items > 0:
+            st.markdown("#### Build warehouse for your existing inventory")
+            st.success(f"Found **{existing_items:,} products** and **{existing_orders:,} order records** already loaded. "
+                       f"The warehouse will be built to fit YOUR inventory.")
+
+            build_mode = st.radio("What to build?", [
+                "🏗️ Build shelves for existing products (keeps your items)",
+                "🔄 Start completely fresh (new items + new warehouse)",
+            ], key="build_mode")
+
+            if build_mode.startswith("🏗️"):
+                # Build warehouse around existing inventory
+                st.markdown("##### Configure rack layout")
+                c1, c2 = st.columns(2)
+                with c1:
+                    racks_per = st.number_input("Racks per zone", 2, 100, max(5, existing_items // 200), key="gen_rp4",
+                                                help="More racks = more shelf space for your items")
+                with c2:
+                    ni = existing_items  # Use existing item count
+                    no = max(existing_orders, 1000)
+                    st.markdown(f"**Products:** {ni:,} (already loaded)")
+                    st.markdown(f"**Orders:** {no:,} (already loaded)")
+
+                # Auto-assign zones from existing items
+                total_racks_est = max(10, existing_items // 20)
+                zone_configs = auto_generate_zone_configs(ni, total_racks_est)
+
+                st.markdown(f"**Auto-generated {len(zone_configs)} zones** sized for your {ni:,} products:")
+                with st.expander("Preview zones", expanded=False):
+                    for zc in zone_configs:
+                        st.markdown(f"- **{zc['name']}** — {', '.join(zc['tags'])} — {zc['racks']} racks — {zc['distance']}m")
+
+                total_racks = sum(z["racks"] for z in zone_configs)
+                est_slots = sum(z["racks"] * z["shelves_per_rack"] * 4 for z in zone_configs)
+                c1, c2, c3 = st.columns(3)
+                with c1: mc("Racks", f"{total_racks:,}")
+                with c2: mc("~Slots", f"{est_slots:,}")
+                with c3:
+                    ratio = round(est_slots / ni * 100) if ni > 0 else 0
+                    mc("Capacity", f"{ratio}%", f"{est_slots:,} slots for {ni:,} items")
+
+                if st.button("🏗️ Build Warehouse for My Products", type="primary", key="gen_existing", use_container_width=True):
+                    # Clear only warehouse structure (zones/racks/slots), keep items + orders
+                    with st.spinner("Clearing old warehouse structure..."):
+                        session.execute(sa_text("UPDATE items SET current_slot_id = NULL"))
+                        session.execute(sa_text("DELETE FROM slots"))
+                        session.execute(sa_text("DELETE FROM racks"))
+                        session.execute(sa_text("DELETE FROM zones"))
+                        session.commit()
+
+                    with st.spinner("Building new zones and racks..."):
+                        for zc in zone_configs:
+                            session.execute(sa_text("INSERT INTO zones (name,tags_json,distance_to_picking_area) VALUES (:n,:t,:d)"),
+                                            {"n": zc["name"], "t": json.dumps(zc["tags"]), "d": zc["distance"]})
+                        session.flush()
+                        zones = session.execute(sa_text("SELECT id, name FROM zones ORDER BY id")).fetchall()
+                        zone_map = {z[1]: z[0] for z in zones}
+                        total_slots = 0
+                        for zc in zone_configs:
+                            zid = zone_map[zc["name"]]
+                            pps = max(1, int(zc.get("shelf_width", 100) / 25))
+                            wps = round(200.0 / zc["shelves_per_rack"] / pps, 2)
+                            for ri in range(zc["racks"]):
+                                rname = f"{zc['name']}-R{ri+1:03d}"
+                                session.execute(sa_text("INSERT INTO racks (zone_id,name,max_weight_kg,num_shelves,shelf_height_cm,shelf_width_cm,shelf_depth_cm) VALUES (:z,:n,200.0,:ns,40.0,:sw,50.0)"),
+                                                {"z": zid, "n": rname, "ns": zc["shelves_per_rack"], "sw": zc.get("shelf_width", 100)})
+                                session.flush()
+                                rid = session.execute(sa_text("SELECT id FROM racks WHERE name=:n"), {"n": rname}).scalar()
+                                row, col = ri // 10, ri % 10
+                                bx, by = (zid - 1) * 100 + col * 10, row * 5
+                                for sh in range(1, zc["shelves_per_rack"] + 1):
+                                    for pos in range(1, pps + 1):
+                                        session.execute(sa_text("INSERT INTO slots (rack_id,shelf_number,position_on_shelf,width_cm,height_cm,depth_cm,current_weight_kg,max_weight_kg,x_coord,y_coord) VALUES (:r,:s,:p,:w,40.0,50.0,0.0,:m,:x,:y)"),
+                                                        {"r": rid, "s": sh, "p": pos, "w": round(zc.get("shelf_width", 100) / pps, 1), "m": wps, "x": bx + pos * 2.0, "y": by + sh * 1.5})
+                                        total_slots += 1
+                        session.commit()
+
+                    st.success(f"Built {len(zone_configs)} zones with {total_slots:,} slots for your {ni:,} products!")
+                    _run_pipeline(session)
+
+                return  # Don't show the "fresh" mode below
+
+        st.markdown("#### Build a completely new warehouse")
+        st.markdown("This creates new items, order history, AND warehouse structure from scratch.")
 
         # Step 1: Quick preset
-        st.markdown("##### Step 1: Choose a starting size")
+        st.markdown("##### Step 1: Choose a size")
         sz = st.radio("", ["Small (demo)", "Medium", "Large", "Custom"], horizontal=True, key="gen_sz", label_visibility="collapsed")
 
         presets = {
@@ -904,21 +991,16 @@ def page_manage_warehouse(session):
         }
         default_nz, default_rp, default_ni, default_no = presets.get(sz, (6, 20, 10000, 50000))
 
-        # Step 2: Adjust numbers (always visible)
         st.markdown("##### Step 2: Adjust quantities")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            nz = st.number_input("Zones", 2, 15, default_nz, key="gen_nz3",
-                                 help="Separate areas in the warehouse (Grocery, Electronics, etc.)")
+            nz = st.number_input("Zones", 2, 15, default_nz, key="gen_nz3")
         with c2:
-            racks_per = st.number_input("Racks per zone", 2, 100, default_rp, key="gen_rp3",
-                                        help="Number of shelving units in each zone")
+            racks_per = st.number_input("Racks/zone", 2, 100, default_rp, key="gen_rp3")
         with c3:
-            ni = st.number_input("Products", 100, 200000, default_ni, step=1000, key="gen_ni3",
-                                 help="Total products to stock in the warehouse")
+            ni = st.number_input("Products", 100, 200000, default_ni, step=1000, key="gen_ni3")
         with c4:
-            no = st.number_input("Order history", 1000, 1000000, default_no, step=5000, key="gen_no3",
-                                 help="Simulated customer orders — more = smarter placement")
+            no = st.number_input("Orders", 1000, 1000000, default_no, step=5000, key="gen_no3")
 
         # Step 3: Zone tag assignment
         st.markdown("##### Step 3: Zone tags")
@@ -1001,8 +1083,8 @@ def page_manage_warehouse(session):
             st.success(f"Built {result['zones']} zones with {result['slots']:,} slots. Added {result['items']:,} products and {result['orders']:,} purchase records.")
             _run_pipeline(session)
 
-    # ── TAB 2: Inventory Manager ─────────────────────────────────
-    with tab2:
+    # ── TAB 1: Inventory Manager (FIRST — add items before building) ──
+    with tab_inv:
         st.markdown("#### 📦 Inventory Manager")
 
         inv_tab1, inv_tab2, inv_tab3, inv_tab4 = st.tabs([
@@ -1217,7 +1299,7 @@ def page_manage_warehouse(session):
                 st.success(f"Replaced inventory: {len(items):,} products, {new_orders:,} order records. Use **Re-Run Placement** to assign them.")
 
     # ── TAB 3: Add racks ────────────────────────────────────────
-    with tab3:
+    with tab_racks:
         st.markdown("#### Add more racks to an existing zone")
         st.caption("Need more shelf space? Add racks to any zone. Then re-run placement to fill them.")
         zl = get_zones_list(session)
@@ -1243,7 +1325,7 @@ def page_manage_warehouse(session):
             st.success(f"Added {added} racks ({est_new_slots} slots) to {sel_zone}!")
 
     # ── TAB 4: Re-run algorithm ─────────────────────────────────
-    with tab4:
+    with tab_run:
         st.markdown("#### Re-run the placement algorithm")
         st.markdown(
             "This will **clear all current placements** and re-run the algorithm from scratch.  \n"
