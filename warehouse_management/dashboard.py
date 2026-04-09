@@ -733,27 +733,34 @@ def page_manage_warehouse(session):
     # ── TAB 1: Generate full warehouse ──────────────────────────
     with tab1:
         st.markdown("#### Build a new warehouse from scratch")
-        st.markdown("This will **replace** your current warehouse. Choose how many zones, racks, products, and purchase history to generate.")
+        st.markdown("This will **replace** your current warehouse with a fresh one.")
 
-        st.markdown("##### 🏭 Warehouse Size")
-        sz = st.radio("Preset size", ["Small (demo)", "Medium", "Large", "Custom"], horizontal=True, key="gen_sz")
+        # Step 1: Quick preset
+        st.markdown("##### Step 1: Choose a starting size")
+        sz = st.radio("", ["Small (demo)", "Medium", "Large", "Custom"], horizontal=True, key="gen_sz", label_visibility="collapsed")
 
         presets = {
             "Small (demo)": (4, 8, 1000, 5000),
             "Medium":       (6, 20, 10000, 50000),
             "Large":        (10, 50, 50000, 200000),
         }
-        if sz in presets:
-            nz, racks_per, ni, no = presets[sz]
-        else:
-            c1, c2 = st.columns(2)
-            with c1:
-                nz = st.slider("Number of zones", 2, 15, 6, key="gen_nz2")
-                ni = st.number_input("Total products to stock", 100, 200000, 10000, step=1000, key="gen_ni2")
-            with c2:
-                racks_per = st.slider("Avg racks per zone", 5, 100, 25, key="gen_rp")
-                no = st.number_input("Purchase history records (for the algorithm)", 1000, 1000000, 50000, step=5000, key="gen_no2",
-                                     help="More records = better predictions of which items are bought together")
+        default_nz, default_rp, default_ni, default_no = presets.get(sz, (6, 20, 10000, 50000))
+
+        # Step 2: Adjust numbers (always visible)
+        st.markdown("##### Step 2: Adjust quantities")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            nz = st.number_input("Zones", 2, 15, default_nz, key="gen_nz3",
+                                 help="Separate areas in the warehouse (Grocery, Electronics, etc.)")
+        with c2:
+            racks_per = st.number_input("Racks per zone", 2, 100, default_rp, key="gen_rp3",
+                                        help="Number of shelving units in each zone")
+        with c3:
+            ni = st.number_input("Products", 100, 200000, default_ni, step=1000, key="gen_ni3",
+                                 help="Total products to stock in the warehouse")
+        with c4:
+            no = st.number_input("Order history", 1000, 1000000, default_no, step=5000, key="gen_no3",
+                                 help="Simulated customer orders — more = smarter placement")
 
         preset_zones = [
             ("Grocery", ["grocery"], 5.0),
