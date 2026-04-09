@@ -32,7 +32,7 @@ except (BrokenPipeError, OSError):
         def update(self, n=1): pass
         def close(self): pass
 
-from .constraints import check_tag_compatibility, filter_compatible_slots_vectorized, filter_with_relaxation
+from .constraints import check_tag_compatibility, tag_preference_score, filter_compatible_slots_vectorized, filter_with_relaxation
 from .warehouse_graph import WarehouseGraph, build_warehouse_graph, slot_to_picking_distance
 
 
@@ -393,9 +393,13 @@ def _ga_fitness(
             daily_picks = idata["daily_picks"]
             total_walk += daily_picks * zone_dist * 2  # round trip
 
-            # Tag compatibility penalty
+            # Safety tag violation = hard penalty (flammable/hazardous/chemical in wrong zone)
             if not check_tag_compatibility(idata["tags"], zone_tags.get(int(zone_id), [])):
                 penalty += 100.0
+            else:
+                # Soft preference: bonus for matching tags, small penalty for mismatched
+                pref = tag_preference_score(idata["tags"], zone_tags.get(int(zone_id), []))
+                total_walk += (1.0 - pref) * 2.0  # slight walk penalty for non-matching zones
 
             zone_item_count[int(zone_id)] += 1
 
@@ -680,7 +684,7 @@ def assign_items_to_slots(
     assigned = 0
     failed = 0
     stats = {"A": 0, "B": 0, "C": 0, "failed_tags": 0, "failed_capacity": 0,
-             "relaxation_counts": {0: 0, 1: 0, 2: 0, 3: 0}, "exceptions": []}
+             "relaxation_counts": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}, "exceptions": []}
     update_batch = []
 
     # Sort items: A first (they get priority for near-picking slots)
@@ -718,7 +722,7 @@ def assign_items_to_slots(
         stats["relaxation_counts"][relax_level] = stats["relaxation_counts"].get(relax_level, 0) + 1
         if relax_level > 0:
             stats["exceptions"].append({"item": item_id, "level": relax_level,
-                                         "type": {1: "dimension", 2: "zone", 3: "weight"}.get(relax_level, "?")})
+                                         "type": {1: "dimension", 2: "zone", 3: "weight", 4: "heavy"}.get(relax_level, "?")})
 
         # Prefer slots in the GA-assigned target zone
         target_zone = item_target_zone.get(item_id)

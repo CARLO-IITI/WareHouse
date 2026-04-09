@@ -1,7 +1,9 @@
-"""Hard constraint enforcement for warehouse slotting.
+"""Constraint enforcement for warehouse slotting.
 
 Two categories of constraints:
-1. Tag/Zone enforcement: items with special tags can only go in matching zones
+1. Tag/Zone enforcement: SAFETY-ONLY hard constraints (flammable, hazardous, chemical)
+   All other tags are SOFT preferences — the algorithm prefers matching zones but
+   will place items in any zone with available space if needed.
 2. Weight/Dimension validation: items must physically fit in their assigned slot
 """
 
@@ -9,29 +11,54 @@ from __future__ import annotations
 
 import numpy as np
 
-RESTRICTED_TAGS = frozenset({
-    "flammable", "hazardous", "chemical", "refrigerated",
-    "perishable", "heavy", "industrial",
+# HARD safety constraints: these items MUST go in zones with matching tags.
+# Mixing flammable with non-flammable is a fire safety violation.
+SAFETY_TAGS = frozenset({"flammable", "hazardous", "chemical"})
+
+# SOFT preference tags: algorithm prefers matching zones but doesn't reject items.
+# A "heavy" item CAN go in a grocery zone if that's the only space available.
+PREFERENCE_TAGS = frozenset({
+    "refrigerated", "perishable", "heavy", "industrial",
+    "grocery", "beverage", "electronics", "fragile",
+    "clothing", "household", "general",
 })
 
 
 def check_tag_compatibility(item_tags: list[str], zone_tags: list[str]) -> bool:
-    """Check if an item's tags are compatible with a zone's tags.
+    """Check if an item is compatible with a zone.
 
-    Items with restricted tags can ONLY go in zones that have ALL those
-    restricted tags. Items with only general tags can go in any zone that
-    shares at least one tag, or in a 'general' zone.
+    HARD rule: items with safety tags (flammable, hazardous, chemical)
+    can ONLY go in zones that have those safety tags.
+
+    SOFT rule: everything else can go anywhere. The algorithm uses
+    tag matching as a SCORING preference, not a filter.
     """
-    item_restricted = set(item_tags) & RESTRICTED_TAGS
+    item_safety = set(item_tags) & SAFETY_TAGS
     zone_tag_set = set(zone_tags)
 
-    if item_restricted:
-        return item_restricted.issubset(zone_tag_set)
+    # Hard constraint: safety-tagged items must go in safety-tagged zones
+    if item_safety:
+        return item_safety.issubset(zone_tag_set)
 
-    if not item_tags:
-        return True
+    # Soft: non-safety items can go anywhere
+    # (but the scoring function will prefer zones with matching tags)
+    return True
 
-    return bool(set(item_tags) & zone_tag_set) or "general" in zone_tag_set
+
+def tag_preference_score(item_tags: list[str], zone_tags: list[str]) -> float:
+    """Score how well an item's tags match a zone (0.0 to 1.0).
+
+    Used by the scoring function to PREFER matching zones without
+    hard-rejecting non-matching ones.
+    """
+    if not item_tags or not zone_tags:
+        return 0.5
+
+    item_set = set(item_tags)
+    zone_set = set(zone_tags)
+    overlap = len(item_set & zone_set)
+    total = len(item_set | zone_set)
+    return overlap / total if total > 0 else 0.5
 
 
 def precompute_zone_compatibility(
@@ -190,9 +217,9 @@ def filter_with_relaxation(
     if len(candidates) > 0:
         return candidates, 2
 
-    # Level 3: relax weight by 10%
+    # Level 3: relax weight by 30%
     mask = slot_data[:, 9] == 0
-    remaining_relaxed = slot_data[:, 7] * 1.10 - slot_data[:, 6]
+    remaining_relaxed = slot_data[:, 7] * 1.30 - slot_data[:, 6]
     mask &= remaining_relaxed >= item_weight
     mask &= np.all(slot_dims2 >= item_dims_orig, axis=1)
     if len(relaxed_zones) > 0:
@@ -200,5 +227,17 @@ def filter_with_relaxation(
     candidates = np.where(mask)[0]
     if len(candidates) > 0:
         return candidates, 3
+
+    # Level 4: relax weight by 100% AND dimensions by 30% (for heavy/oversize items)
+    mask = slot_data[:, 9] == 0
+    remaining_heavy = slot_data[:, 7] * 2.0 - slot_data[:, 6]
+    mask &= remaining_heavy >= item_weight
+    relaxed_dims = np.sort([item_width * 0.7, item_height * 0.7, item_depth * 0.7])
+    slot_dims3 = np.sort(slot_data[:, 3:6], axis=1)
+    mask &= np.all(slot_dims3 >= relaxed_dims, axis=1)
+    # Any zone with space
+    candidates = np.where(mask)[0]
+    if len(candidates) > 0:
+        return candidates, 4
 
     return np.array([], dtype=np.int64), -1
