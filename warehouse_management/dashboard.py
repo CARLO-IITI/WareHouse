@@ -231,6 +231,145 @@ def _render_product_detail(detail):
                      height=min(220, len(nb_data) * 40 + 40))
 
 
+def _render_prebuild_preview(n_items: int, n_orders: int, zone_configs: list, est_slots: int):
+    """Show a preview of what will be generated before building the warehouse."""
+    from warehouse_management.test_data import AFFINITY_GROUPS
+
+    # ── A: Product Mix Breakdown ──
+    filler_cats = [
+        ("Grocery", ["grocery"]),
+        ("Household", ["chemical", "household"]),
+        ("Electronics", ["electronics", "fragile"]),
+        ("Clothing", ["clothing"]),
+        ("General", ["general"]),
+        ("Tools/Hardware", ["heavy", "industrial"]),
+        ("Beverages", ["grocery", "beverage"]),
+    ]
+
+    # Count affinity group items per tag set
+    aff_count = 0
+    aff_by_cat: dict[str, int] = {}
+    for gn, gr in AFFINITY_GROUPS.items():
+        label = gn.replace("_", " ").title()
+        cnt = len(gr["items"])
+        aff_count += cnt
+        aff_by_cat[label] = cnt
+
+    # Filler distribution
+    remaining = max(0, n_items - aff_count)
+    per_cat = remaining // len(filler_cats) if filler_cats else 0
+    cat_counts = {}
+    for cat_name, _ in filler_cats:
+        cat_counts[cat_name] = per_cat
+    # Add affinity items to their parent categories
+    aff_cat_map = {
+        "Breakfast": "Grocery", "Pasta Dinner": "Grocery", "Baking": "Grocery",
+        "Snacks": "Grocery", "Beverages": "Beverages", "Dairy Cold": "Grocery",
+        "Cleaning": "Household", "Personal Care": "Household",
+        "Flammable Goods": "Household", "Electronics Acc": "Electronics",
+        "Clothing Basics": "Clothing", "Heavy Tools": "Tools/Hardware",
+    }
+    for aff_name, cnt in aff_by_cat.items():
+        parent = aff_cat_map.get(aff_name, "General")
+        cat_counts[parent] = cat_counts.get(parent, 0) + cnt
+
+    with st.expander("📊 Preview: What will be generated", expanded=True):
+        # Product mix pie chart + metrics
+        col_chart, col_info = st.columns([1, 1])
+
+        with col_chart:
+            st.markdown("**Product Mix by Category**")
+            names = list(cat_counts.keys())
+            values = list(cat_counts.values())
+            fig = px.pie(names=names, values=values, hole=0.4,
+                         color_discrete_sequence=ZONE_COLORS)
+            fig.update_layout(height=280, template="plotly_dark", paper_bgcolor="#080c18",
+                              margin=dict(l=5, r=5, t=5, b=5), legend=dict(font=dict(size=9)))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col_info:
+            st.markdown("**Estimated Breakdown**")
+            for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]):
+                pct = round(cnt / n_items * 100, 1) if n_items > 0 else 0
+                bar_w = min(100, pct * 3)
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:6px;margin:2px 0;font-size:.75rem">'
+                    f'<span style="width:90px;color:#cbd5e1;font-weight:600">{cat}</span>'
+                    f'<div style="flex:1;height:8px;background:#1e293b;border-radius:3px;overflow:hidden">'
+                    f'<div style="width:{bar_w}%;height:100%;background:#3b82f6;border-radius:3px"></div></div>'
+                    f'<span style="color:#94a3b8;width:70px;text-align:right">{cnt:,} ({pct}%)</span>'
+                    f'</div>', unsafe_allow_html=True)
+
+            # Capacity check
+            if n_items > est_slots:
+                st.warning(f"⚠️ {n_items:,} products > {est_slots:,} slots — some items won't fit. Add more racks.")
+            else:
+                st.success(f"✅ {est_slots:,} slots for {n_items:,} products — enough capacity ({round(n_items/est_slots*100)}% fill)")
+
+        # ── B: Affinity Groups ──
+        st.markdown("---")
+        st.markdown("**🔗 Co-Purchase Affinity Groups** — items the algorithm will try to place NEAR each other")
+        cols = st.columns(3)
+        for idx, (gn, gr) in enumerate(AFFINITY_GROUPS.items()):
+            label = gn.replace("_", " ").title()
+            items_str = ", ".join(gr["items"][:6])
+            extra = f" +{len(gr['items'])-6} more" if len(gr["items"]) > 6 else ""
+            tag_str = ", ".join(gr["tags"])
+            with cols[idx % 3]:
+                st.markdown(
+                    f'<div style="background:#0c1424;border:1px solid #1e293b;border-radius:8px;padding:8px;margin-bottom:6px">'
+                    f'<div style="color:#38bdf8;font-weight:700;font-size:.78rem">{label}</div>'
+                    f'<div style="color:#64748b;font-size:.58rem;margin:2px 0">{tag_str} · {len(gr["items"])} items</div>'
+                    f'<div style="color:#94a3b8;font-size:.68rem">{items_str}{extra}</div>'
+                    f'</div>', unsafe_allow_html=True)
+
+        # ── C: Velocity Estimate ──
+        st.markdown("---")
+        st.markdown("**⚡ Estimated Velocity Distribution** — based on order history")
+
+        # Estimate: ~70% of items will have orders, of those 20%=A, 30%=B, 50%=C
+        items_with_orders = min(n_items, int(n_orders * 0.7))
+        est_a = int(items_with_orders * 0.20)
+        est_b = int(items_with_orders * 0.30)
+        est_c = n_items - est_a - est_b
+
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        with vc1: mc("Fast Movers", f"{est_a:,}", "Near picking area")
+        with vc2: mc("Regular", f"{est_b:,}", "Mid-range zones")
+        with vc3: mc("Slow Movers", f"{est_c:,}", "Far zones")
+        with vc4: mc("Order Records", f"{n_orders:,}", "For affinity analysis")
+
+        st.caption(f"With {n_orders:,} order records, ~{items_with_orders:,} products will have purchase history. "
+                   f"Top 20% by order frequency → Fast Movers (placed nearest to picking area).")
+
+        # ── D: Zone-Category Fit ──
+        st.markdown("---")
+        st.markdown("**🏭 Zone-Category Fit Check** — will every category have enough space?")
+
+        fit_data = []
+        for zc in zone_configs:
+            zone_slots = zc["racks"] * zc.get("shelves_per_rack", 6) * 4
+            # Find categories that match this zone's tags
+            matching_cats = []
+            for cat_name, cat_tags in filler_cats:
+                if set(cat_tags) & set(zc["tags"]) or "general" in zc["tags"]:
+                    matching_cats.append(cat_name)
+            match_str = ", ".join(matching_cats[:3]) if matching_cats else "Any"
+            total_items_for_zone = sum(cat_counts.get(c, 0) for c in matching_cats)
+
+            ok = "✅" if zone_slots >= total_items_for_zone // max(1, len([z for z in zone_configs if set(z["tags"]) & set(zc["tags"])])) else "⚠️"
+            fit_data.append({
+                "Zone": zc["name"],
+                "Tags": ", ".join(zc["tags"]),
+                "Racks": zc["racks"],
+                "Slots": zone_slots,
+                "Matches": match_str,
+                "Fit": ok,
+            })
+
+        st.dataframe(pd.DataFrame(fit_data), use_container_width=True, hide_index=True, height=min(300, len(fit_data)*40+40))
+
+
 # ═══════════════════════════════════════════════════════════════
 # PAGE 1: WAREHOUSE MAP  (2D floor plan, all zones visible)
 # ═══════════════════════════════════════════════════════════════
@@ -851,10 +990,14 @@ def page_manage_warehouse(session):
         total_racks = sum(z["racks"] for z in zone_configs)
         est_slots = sum(z["racks"] * z["shelves_per_rack"] * 4 for z in zone_configs)
         c1,c2,c3,c4 = st.columns(4)
-        with c1: mc("Zones", str(nz))
+        with c1: mc("Zones", str(len(zone_configs)))
         with c2: mc("Racks", f"{total_racks:,}")
         with c3: mc("~Slots", f"{est_slots:,}")
         with c4: mc("Products", f"{ni:,}")
+
+        # ── Step 4: Preview what will be generated ──
+        st.markdown("##### Step 4: Preview")
+        _render_prebuild_preview(ni, no, zone_configs, est_slots)
 
         if st.button("🏗️ Build Warehouse & Place Products", type="primary", key="gen_go2", use_container_width=True):
             with st.spinner("Building warehouse..."):
